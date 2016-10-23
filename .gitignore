@@ -9,3 +9,5 @@ autom4te.cache
 .DS_Store
 .idea
 *~
+
+build/vagrant/debian-jessie-amd64/Vagrantfile

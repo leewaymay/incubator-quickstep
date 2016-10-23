@@ -74,7 +74,7 @@ class Transaction {
    * @param status New status of the transaction.
    **/
   inline void setStatus(TransactionStatus status) {
-    status_ = status;
+    status_ = status_;
   }
 
   /**
