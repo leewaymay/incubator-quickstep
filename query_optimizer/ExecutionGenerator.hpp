@@ -33,7 +33,7 @@
 #include "catalog/CatalogTypedefs.hpp"
 #include "query_execution/QueryContext.hpp"
 #include "query_execution/QueryContext.pb.h"
-#include "query_optimizer/ExecutionHeuristics.hpp"
+#include "query_optimizer/LIPFilterGenerator.hpp"
 #include "query_optimizer/QueryHandle.hpp"
 #include "query_optimizer/QueryPlan.hpp"
 #include "query_optimizer/cost_model/CostModel.hpp"
@@ -102,8 +102,7 @@ class ExecutionGenerator {
       : catalog_database_(DCHECK_NOTNULL(catalog_database)),
         query_handle_(DCHECK_NOTNULL(query_handle)),
         execution_plan_(DCHECK_NOTNULL(query_handle->getQueryPlanMutable())),
-        query_context_proto_(DCHECK_NOTNULL(query_handle->getQueryContextProtoMutable())),
-        execution_heuristics_(new ExecutionHeuristics()) {
+        query_context_proto_(DCHECK_NOTNULL(query_handle->getQueryContextProtoMutable())) {
     query_context_proto_->set_query_id(query_handle_->query_id());
 #ifdef QUICKSTEP_DISTRIBUTED
     catalog_database_cache_proto_ = DCHECK_NOTNULL(query_handle->getCatalogDatabaseCacheProtoMutable());
@@ -386,7 +385,6 @@ class ExecutionGenerator {
   QueryHandle *query_handle_;
   QueryPlan *execution_plan_;  // A part of QueryHandle.
   serialization::QueryContext *query_context_proto_;  // A part of QueryHandle.
-  std::unique_ptr<ExecutionHeuristics> execution_heuristics_;
 
 #ifdef QUICKSTEP_DISTRIBUTED
   serialization::CatalogDatabase *catalog_database_cache_proto_;  // A part of QueryHandle.
@@ -419,11 +417,19 @@ class ExecutionGenerator {
   std::vector<CatalogRelationInfo> temporary_relation_info_vec_;
 
   /**
-   * @brief The cost model to use for creating the execution plan.
+   * @brief The cost model to use for estimating aggregation hash table size.
    */
-  std::unique_ptr<cost::CostModel> cost_model_;
+  std::unique_ptr<cost::CostModel> cost_model_for_aggregation_;
+
+  /**
+   * @brief The cost model to use for estimating join hash table size.
+   */
+  std::unique_ptr<cost::CostModel> cost_model_for_hash_join_;
 
   physical::TopLevelPlanPtr top_level_physical_plan_;
+
+  // Sub-generator for deploying LIP (lookahead information passing) filters.
+  std::unique_ptr<LIPFilterGenerator> lip_filter_generator_;
 
   DISALLOW_COPY_AND_ASSIGN(ExecutionGenerator);
 };

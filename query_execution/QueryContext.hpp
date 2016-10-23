@@ -35,9 +35,10 @@
 #include "storage/InsertDestination.hpp"
 #include "storage/WindowAggregationOperationState.hpp"
 #include "types/containers/Tuple.hpp"
-#include "utility/BloomFilter.hpp"
 #include "utility/Macros.hpp"
 #include "utility/SortConfiguration.hpp"
+#include "utility/lip_filter/LIPFilter.hpp"
+#include "utility/lip_filter/LIPFilterDeployment.hpp"
 
 #include "glog/logging.h"
 
@@ -67,11 +68,6 @@ class QueryContext {
   typedef std::uint32_t aggregation_state_id;
 
   /**
-   * @brief A unique identifier for a BloomFilter per query.
-   **/
-  typedef std::uint32_t bloom_filter_id;
-
-  /**
    * @brief A unique identifier for a GeneratorFunctionHandle per query.
    **/
   typedef std::uint32_t generator_function_id;
@@ -88,6 +84,17 @@ class QueryContext {
    * @brief A unique identifier for a JoinHashTable per query.
    **/
   typedef std::uint32_t join_hash_table_id;
+
+  /**
+   * @brief A unique identifier for a LIPFilterDeployment per query.
+   **/
+  typedef std::uint32_t lip_deployment_id;
+  static constexpr lip_deployment_id kInvalidLIPDeploymentId = static_cast<lip_deployment_id>(-1);
+
+  /**
+   * @brief A unique identifier for a LIPFilter per query.
+   **/
+  typedef std::uint32_t lip_filter_id;
 
   /**
    * @brief A unique identifier for a Predicate per query.
@@ -193,49 +200,17 @@ class QueryContext {
   }
 
   /**
-   * @brief Whether the given BloomFilter id is valid.
+   * @brief Destroy the payloads from the aggregation hash tables.
    *
-   * @param id The BloomFilter id.
+   * @warning After calling these methods, the hash table will be in an invalid
+   *          state. No other operation should be performed on them.
    *
-   * @return True if valid, otherwise false.
+   * @param id The ID of the AggregationOperationState.
    **/
-  bool isValidBloomFilterId(const bloom_filter_id id) const {
-    return id < bloom_filters_.size();
-  }
-
-  /**
-   * @brief Get a mutable reference to the BloomFilter.
-   *
-   * @param id The BloomFilter id.
-   *
-   * @return The BloomFilter, already created in the constructor.
-   **/
-  inline BloomFilter* getBloomFilterMutable(const bloom_filter_id id) {
-    DCHECK_LT(id, bloom_filters_.size());
-    return bloom_filters_[id].get();
-  }
-
-  /**
-   * @brief Get a constant pointer to the BloomFilter.
-   *
-   * @param id The BloomFilter id.
-   *
-   * @return The constant pointer to BloomFilter that is
-   *         already created in the constructor.
-   **/
-  inline const BloomFilter* getBloomFilter(const bloom_filter_id id) const {
-    DCHECK_LT(id, bloom_filters_.size());
-    return bloom_filters_[id].get();
-  }
-
-  /**
-   * @brief Destory the given BloomFilter.
-   *
-   * @param id The id of the BloomFilter to destroy.
-   **/
-  inline void destroyBloomFilter(const bloom_filter_id id) {
-    DCHECK_LT(id, bloom_filters_.size());
-    bloom_filters_[id].reset();
+  inline void destroyAggregationHashTablePayload(const aggregation_state_id id) {
+    DCHECK_LT(id, aggregation_states_.size());
+    DCHECK(aggregation_states_[id]);
+    aggregation_states_[id]->destroyAggregationHashTablePayload();
   }
 
   /**
@@ -330,6 +305,87 @@ class QueryContext {
   inline void destroyJoinHashTable(const join_hash_table_id id) {
     DCHECK_LT(id, join_hash_tables_.size());
     join_hash_tables_[id].reset();
+  }
+
+  /**
+   * @brief Whether the given LIPFilterDeployment id is valid.
+   *
+   * @param id The LIPFilterDeployment id.
+   *
+   * @return True if valid, otherwise false.
+   **/
+  bool isValidLIPDeploymentId(const lip_deployment_id id) const {
+    return id < lip_deployments_.size();
+  }
+
+  /**
+   * @brief Get a constant pointer to the LIPFilterDeployment.
+   *
+   * @param id The LIPFilterDeployment id.
+   *
+   * @return The constant pointer to LIPFilterDeployment that is
+   *         already created in the constructor.
+   **/
+  inline const LIPFilterDeployment* getLIPDeployment(
+      const lip_deployment_id id) const {
+    DCHECK_LT(id, lip_deployments_.size());
+    return lip_deployments_[id].get();
+  }
+
+  /**
+   * @brief Destory the given LIPFilterDeployment.
+   *
+   * @param id The id of the LIPFilterDeployment to destroy.
+   **/
+  inline void destroyLIPDeployment(const lip_deployment_id id) {
+    DCHECK_LT(id, lip_deployments_.size());
+    lip_deployments_[id].reset();
+  }
+
+  /**
+   * @brief Whether the given LIPFilter id is valid.
+   *
+   * @param id The LIPFilter id.
+   *
+   * @return True if valid, otherwise false.
+   **/
+  bool isValidLIPFilterId(const lip_filter_id id) const {
+    return id < lip_filters_.size();
+  }
+
+  /**
+   * @brief Get a mutable reference to the LIPFilter.
+   *
+   * @param id The LIPFilter id.
+   *
+   * @return The LIPFilter, already created in the constructor.
+   **/
+  inline LIPFilter* getLIPFilterMutable(const lip_filter_id id) {
+    DCHECK_LT(id, lip_filters_.size());
+    return lip_filters_[id].get();
+  }
+
+  /**
+   * @brief Get a constant pointer to the LIPFilter.
+   *
+   * @param id The LIPFilter id.
+   *
+   * @return The constant pointer to LIPFilter that is
+   *         already created in the constructor.
+   **/
+  inline const LIPFilter* getLIPFilter(const lip_filter_id id) const {
+    DCHECK_LT(id, lip_filters_.size());
+    return lip_filters_[id].get();
+  }
+
+  /**
+   * @brief Destory the given LIPFilter.
+   *
+   * @param id The id of the LIPFilter to destroy.
+   **/
+  inline void destroyLIPFilter(const lip_filter_id id) {
+    DCHECK_LT(id, lip_filters_.size());
+    lip_filters_[id].reset();
   }
 
   /**
@@ -507,10 +563,11 @@ class QueryContext {
 
  private:
   std::vector<std::unique_ptr<AggregationOperationState>> aggregation_states_;
-  std::vector<std::unique_ptr<BloomFilter>> bloom_filters_;
   std::vector<std::unique_ptr<const GeneratorFunctionHandle>> generator_functions_;
   std::vector<std::unique_ptr<InsertDestination>> insert_destinations_;
   std::vector<std::unique_ptr<JoinHashTable>> join_hash_tables_;
+  std::vector<std::unique_ptr<LIPFilterDeployment>> lip_deployments_;
+  std::vector<std::unique_ptr<LIPFilter>> lip_filters_;
   std::vector<std::unique_ptr<const Predicate>> predicates_;
   std::vector<std::vector<std::unique_ptr<const Scalar>>> scalar_groups_;
   std::vector<std::unique_ptr<const SortConfiguration>> sort_configs_;

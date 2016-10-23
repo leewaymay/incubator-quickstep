@@ -54,10 +54,11 @@
 #include "expressions/window_aggregation/WindowAggregateFunction.pb.h"
 #include "query_execution/QueryContext.hpp"
 #include "query_execution/QueryContext.pb.h"
-#include "query_optimizer/ExecutionHeuristics.hpp"
+#include "query_optimizer/LIPFilterGenerator.hpp"
 #include "query_optimizer/OptimizerContext.hpp"
 #include "query_optimizer/QueryHandle.hpp"
 #include "query_optimizer/QueryPlan.hpp"
+#include "query_optimizer/cost_model/SimpleCostModel.hpp"
 #include "query_optimizer/cost_model/StarSchemaSimpleCostModel.hpp"
 #include "query_optimizer/expressions/AggregateFunction.hpp"
 #include "query_optimizer/expressions/Alias.hpp"
@@ -76,6 +77,7 @@
 #include "query_optimizer/physical/HashJoin.hpp"
 #include "query_optimizer/physical/InsertSelection.hpp"
 #include "query_optimizer/physical/InsertTuple.hpp"
+#include "query_optimizer/physical/LIPFilterConfiguration.hpp"
 #include "query_optimizer/physical/NestedLoopsJoin.hpp"
 #include "query_optimizer/physical/PatternMatcher.hpp"
 #include "query_optimizer/physical/Physical.hpp"
@@ -153,9 +155,6 @@ static const volatile bool aggregate_hashtable_type_dummy
 
 DEFINE_bool(parallelize_load, true, "Parallelize loading data files.");
 
-DEFINE_bool(optimize_joins, false,
-            "Enable post execution plan generation optimizations for joins.");
-
 namespace E = ::quickstep::optimizer::expressions;
 namespace P = ::quickstep::optimizer::physical;
 namespace S = ::quickstep::serialization;
@@ -166,8 +165,16 @@ void ExecutionGenerator::generatePlan(const P::PhysicalPtr &physical_plan) {
   CHECK(P::SomeTopLevelPlan::MatchesWithConditionalCast(physical_plan, &top_level_physical_plan_))
       << "The physical plan must be rooted by a TopLevelPlan";
 
-  cost_model_.reset(
+  cost_model_for_aggregation_.reset(
       new cost::StarSchemaSimpleCostModel(top_level_physical_plan_->shared_subplans()));
+  cost_model_for_hash_join_.reset(
+      new cost::SimpleCostModel(top_level_physical_plan_->shared_subplans()));
+
+  const auto &lip_filter_configuration =
+      top_level_physical_plan_->lip_filter_configuration();
+  if (lip_filter_configuration != nullptr) {
+    lip_filter_generator_.reset(new LIPFilterGenerator(lip_filter_configuration));
+  }
 
   const CatalogRelation *result_relation = nullptr;
 
@@ -176,6 +183,11 @@ void ExecutionGenerator::generatePlan(const P::PhysicalPtr &physical_plan) {
       generatePlanInternal(shared_subplan);
     }
     generatePlanInternal(top_level_physical_plan_->plan());
+
+    // Deploy LIPFilters if enabled.
+    if (lip_filter_generator_ != nullptr) {
+      lip_filter_generator_->deployLIPFilters(execution_plan_, query_context_proto_);
+    }
 
     // Set the query result relation if the input plan exists in physical_to_execution_map_,
     // which indicates the plan is the result of a SELECT query.
@@ -211,11 +223,6 @@ void ExecutionGenerator::generatePlan(const P::PhysicalPtr &physical_plan) {
         temporary_relation_info.producer_operator_index);
   }
 
-  // Optimize execution plan based on heuristics captured during execution plan generation, if enabled.
-  if (FLAGS_optimize_joins) {
-    execution_heuristics_->optimizeExecutionPlan(execution_plan_, query_context_proto_);
-  }
-
 #ifdef QUICKSTEP_DISTRIBUTED
   catalog_database_cache_proto_->set_name(catalog_database_->getName());
 
@@ -236,6 +243,11 @@ void ExecutionGenerator::generatePlanInternal(
   // Generate the execution plan in bottom-up.
   for (const P::PhysicalPtr &child : physical_plan->children()) {
     generatePlanInternal(child);
+  }
+
+  // If enabled, collect attribute substitution map for LIPFilterGenerator.
+  if (lip_filter_generator_ != nullptr) {
+    lip_filter_generator_->registerAttributeMap(physical_plan, attribute_substitution_map_);
   }
 
   switch (physical_plan->getPhysicalType()) {
@@ -569,6 +581,10 @@ void ExecutionGenerator::convertSelection(
       std::forward_as_tuple(select_index,
                             output_relation));
   temporary_relation_info_vec_.emplace_back(select_index, output_relation);
+
+  if (lip_filter_generator_ != nullptr) {
+    lip_filter_generator_->addSelectionInfo(physical_selection, select_index);
+  }
 }
 
 void ExecutionGenerator::convertSharedSubplanReference(const physical::SharedSubplanReferencePtr &physical_plan) {
@@ -600,34 +616,15 @@ void ExecutionGenerator::convertHashJoin(const P::HashJoinPtr &physical_plan) {
   std::vector<attribute_id> probe_attribute_ids;
   std::vector<attribute_id> build_attribute_ids;
 
-  std::vector<attribute_id> probe_original_attribute_ids;
-  std::vector<attribute_id> build_original_attribute_ids;
-
-  const CatalogRelation *referenced_stored_probe_relation = nullptr;
-  const CatalogRelation *referenced_stored_build_relation = nullptr;
-
-  std::size_t build_cardinality = cost_model_->estimateCardinality(build_physical);
+  std::size_t build_cardinality =
+      cost_model_for_hash_join_->estimateCardinality(build_physical);
 
   bool any_probe_attributes_nullable = false;
   bool any_build_attributes_nullable = false;
 
-  bool skip_hash_join_optimization = false;
-
   const std::vector<E::AttributeReferencePtr> &left_join_attributes =
       physical_plan->left_join_attributes();
   for (const E::AttributeReferencePtr &left_join_attribute : left_join_attributes) {
-    // Try to determine the original stored relation referenced in the Hash Join.
-    referenced_stored_probe_relation =
-        catalog_database_->getRelationByName(left_join_attribute->relation_name());
-    if (referenced_stored_probe_relation == nullptr) {
-      // Hash Join optimizations are not possible, if the referenced relation cannot be determined.
-      skip_hash_join_optimization = true;
-    } else {
-      const attribute_id probe_operator_attribute_id =
-          referenced_stored_probe_relation->getAttributeByName(left_join_attribute->attribute_name())->getID();
-      probe_original_attribute_ids.emplace_back(probe_operator_attribute_id);
-    }
-
     const CatalogAttribute *probe_catalog_attribute
         = attribute_substitution_map_[left_join_attribute->id()];
     probe_attribute_ids.emplace_back(probe_catalog_attribute->getID());
@@ -640,18 +637,6 @@ void ExecutionGenerator::convertHashJoin(const P::HashJoinPtr &physical_plan) {
   const std::vector<E::AttributeReferencePtr> &right_join_attributes =
       physical_plan->right_join_attributes();
   for (const E::AttributeReferencePtr &right_join_attribute : right_join_attributes) {
-    // Try to determine the original stored relation referenced in the Hash Join.
-    referenced_stored_build_relation =
-        catalog_database_->getRelationByName(right_join_attribute->relation_name());
-    if (referenced_stored_build_relation == nullptr) {
-      // Hash Join optimizations are not possible, if the referenced relation cannot be determined.
-      skip_hash_join_optimization = true;
-    } else {
-      const attribute_id build_operator_attribute_id =
-          referenced_stored_build_relation->getAttributeByName(right_join_attribute->attribute_name())->getID();
-      build_original_attribute_ids.emplace_back(build_operator_attribute_id);
-    }
-
     const CatalogAttribute *build_catalog_attribute
         = attribute_substitution_map_[right_join_attribute->id()];
     build_attribute_ids.emplace_back(build_catalog_attribute->getID());
@@ -829,15 +814,10 @@ void ExecutionGenerator::convertHashJoin(const P::HashJoinPtr &physical_plan) {
                             output_relation));
   temporary_relation_info_vec_.emplace_back(join_operator_index, output_relation);
 
-  // Add heuristics for the Hash Join, if enabled.
-  if (FLAGS_optimize_joins && !skip_hash_join_optimization) {
-    execution_heuristics_->addHashJoinInfo(build_operator_index,
-                                           join_operator_index,
-                                           referenced_stored_build_relation,
-                                           referenced_stored_probe_relation,
-                                           std::move(build_original_attribute_ids),
-                                           std::move(probe_original_attribute_ids),
-                                           join_hash_table_index);
+  if (lip_filter_generator_ != nullptr) {
+    lip_filter_generator_->addHashJoinInfo(physical_plan,
+                                           build_operator_index,
+                                           join_operator_index);
   }
 }
 
@@ -1412,7 +1392,7 @@ void ExecutionGenerator::convertAggregate(
   }
 
   const std::size_t estimated_num_groups =
-      cost_model_->estimateNumGroupsForAggregate(physical_plan);
+      cost_model_for_aggregation_->estimateNumGroupsForAggregate(physical_plan);
   aggr_state_proto->set_estimated_num_entries(std::max(16uL, estimated_num_groups));
 
   const QueryPlan::DAGNodeIndex aggregation_operator_index =
@@ -1466,6 +1446,11 @@ void ExecutionGenerator::convertAggregate(
   execution_plan_->addDirectDependency(destroy_aggregation_state_operator_index,
                                        finalize_aggregation_operator_index,
                                        true);
+
+  if (lip_filter_generator_ != nullptr) {
+    lip_filter_generator_->addAggregateInfo(physical_plan,
+                                            aggregation_operator_index);
+  }
 }
 
 void ExecutionGenerator::convertSort(const P::SortPtr &physical_sort) {
